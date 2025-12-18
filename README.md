@@ -18,3 +18,10 @@ Windows by skipping critical system, network, GPU, and security services.
 ### Dry run (recommended first)
 ```powershell
 .\cleanup-non-windows-services.ps1
+
+
+## One-liner (no file download)
+
+Preview only:
+```powershell
+irm https://raw.githubusercontent.com/Nathansxxss/Process-Removal-Script/main/cleanup-non-windows-services.ps1 | iex
