@@ -1,129 +1,81 @@
 <#
 .SYNOPSIS
-    Safely lists and optionally disables non-Windows automatic services.
+    Scans for potentially suspicious non-Microsoft Windows services.
 
 .DESCRIPTION
-    This script is designed to help reduce unnecessary background services
-    WITHOUT breaking Windows.
+    This script performs a READ-ONLY scan of installed services and
+    highlights entries that may warrant further investigation.
 
-    - Dry-run by default (no changes unless -Apply is used)
-    - Creates a System Restore Point before applying changes
-    - Skips critical Windows, network, GPU, input, and security services
-    - Generates an undo script automatically
+    It does NOT disable, stop, or modify any services.
 
-    This is NOT a debloat or "nuke services" script.
-    It is intentionally conservative.
+    Heuristics used:
+    - Non-Microsoft services
+    - Executables outside standard system/program paths
+    - Unsigned binaries
+    - Random-looking service names
+    - Known malware persistence locations
 
-.PARAMETER Apply
-    Actually apply changes. Without this flag, the script only shows what
-    would be changed.
+    This is NOT a malware remover.
+    It is an investigation aid.
 
 .AUTHOR
     Nathansxxss
 #>
 
-param (
-    [switch]$Apply
-)
-
-Write-Host "=== Safe Non-Windows Service Cleanup ===" -ForegroundColor Cyan
-Write-Host "Dry-run mode is ON by default." -ForegroundColor Gray
+Write-Host "=== Suspicious Service Scan (Read-Only) ===" -ForegroundColor Cyan
+Write-Host "No changes will be made." -ForegroundColor Gray
 Write-Host ""
 
-# Keywords that should NEVER be touched
-$CriticalKeywords = @(
-    "windows",
-    "microsoft",
-    "winlogon",
-    "explorer",
-    "network",
-    "ethernet",
-    "wifi",
-    "bluetooth",
-    "dhcp",
-    "nvidia",
-    "amd",
-    "intel",
-    "audio",
-    "sound",
-    "input",
-    "hid",
-    "usb",
-    "display",
-    "gpu",
-    "security",
-    "defender",
-    "firewall",
-    "event",
-    "time",
-    "rpc",
-    "crypt",
-    "update",
-    "store"
+# Known safe root paths
+$SafePaths = @(
+    "C:\Windows\",
+    "C:\Program Files\",
+    "C:\Program Files (x86)\"
 )
 
-# Get automatic services that are currently running
-$services = Get-Service | Where-Object {
-    $_.StartType -eq "Automatic" -and
-    $_.Status -eq "Running"
+# Regex for random / garbage-like names
+$RandomNamePattern = '^[a-zA-Z]{1,3}\d{3,}$|^[a-f0-9]{8,}$'
+
+# Get services with executable paths
+$services = Get-CimInstance Win32_Service | Where-Object {
+    $_.State -eq "Running"
 }
 
-# Filter out anything that looks critical
-$targets = $services | Where-Object {
-    $serviceName = $_.Name.ToLower()
+$suspicious = @()
 
-    foreach ($keyword in $CriticalKeywords) {
-        if ($serviceName -like "*$keyword*") {
-            return $false
+foreach ($svc in $services) {
+    # Skip Microsoft services outright
+    if ($svc.Manufacturer -eq "Microsoft Corporation") {
+        continue
+    }
+
+    $exePath = $svc.PathName -replace '"', ''
+    $exePath = $exePath.Split(' ')[0]
+
+    $flags = @()
+
+    # 1. Unusual install location
+    if ($exePath -and -not ($SafePaths | Where-Object { $exePath.StartsWith($_, 'OrdinalIgnoreCase') })) {
+        $flags += "Non-standard path"
+    }
+
+    # 2. Unsigned binary
+    if (Test-Path $exePath) {
+        $sig = Get-AuthenticodeSignature $exePath
+        if ($sig.Status -ne "Valid") {
+            $flags += "Unsigned executable"
         }
     }
 
-    return $true
-}
+    # 3. Random-looking service name
+    if ($svc.Name -match $RandomNamePattern) {
+        $flags += "Suspicious service name"
+    }
 
-if (-not $targets -or $targets.Count -eq 0) {
-    Write-Host "No safe-to-disable services were found." -ForegroundColor Green
-    return
-}
+    # 4. Known bad persistence locations
+    if ($exePath -match "\\AppData\\|\\Temp\\|\\ProgramData\\") {
+        $flags += "User-writable location"
+    }
 
-Write-Host "The following services were identified:" -ForegroundColor Yellow
-$targets | Select-Object Name, DisplayName | Format-Table -AutoSize
+    if ($flags.C
 
-# Dry-run exit
-if (-not $Apply) {
-    Write-Host ""
-    Write-Host "DRY RUN ONLY — no changes have been made." -ForegroundColor Cyan
-    Write-Host "If everything looks OK, run:" -ForegroundColor Gray
-    Write-Host "  .\cleanup-non-windows-services.ps1 -Apply" -ForegroundColor Green
-    return
-}
-
-# Create a restore point
-Write-Host ""
-Write-Host "Creating system restore point..." -ForegroundColor Cyan
-Checkpoint-Computer `
-    -Description "Before non-Windows service cleanup" `
-    -RestorePointType "MODIFY_SETTINGS"
-
-# Build undo script
-$undoLines = @()
-foreach ($svc in $targets) {
-    $undoLines += "Set-Service -Name `"$($svc.Name)`" -StartupType Automatic"
-}
-
-$undoPath = Join-Path $PSScriptRoot "undo-services.ps1"
-$undoLines | Out-File -FilePath $undoPath -Encoding UTF8
-
-Write-Host "Undo script created: undo-services.ps1" -ForegroundColor Green
-
-# Apply changes
-Write-Host ""
-Write-Host "Applying changes..." -ForegroundColor Red
-
-foreach ($svc in $targets) {
-    Write-Host " - Setting $($svc.Name) to Manual"
-    Set-Service -Name $svc.Name -StartupType Manual
-}
-
-Write-Host ""
-Write-Host "Done. A reboot is recommended." -ForegroundColor Cyan
