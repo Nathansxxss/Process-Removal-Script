@@ -15,11 +15,6 @@ Windows by skipping critical system, network, GPU, and security services.
 
 ## Usage
 
-### Dry run (recommended first)
-```powershell
-.\cleanup-non-windows-services.ps1
-
-
 ## One-liner (no file download)
 
 Preview only:
