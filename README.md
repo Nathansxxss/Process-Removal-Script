@@ -1,8 +1,20 @@
-# Process-Removal-Script
-PowerShell scripts to identify and disable unnecessary non-Windows background services.
+# Process Removal Script
 
+A **safe and conservative PowerShell script** for identifying and managing
+non-Windows background services.
 
-## Disclaimer
-This script is intentionally conservative. It is not a debloat tool and does
-not attempt to aggressively disable services. Always review changes before
-applying.
+This script is **dry-run by default** and is designed to avoid breaking
+Windows by skipping critical system, network, GPU, and security services.
+
+## Features
+- Dry-run mode (no changes unless explicitly applied)
+- Automatic system restore point
+- Generates an undo script
+- Avoids Windows core services
+- Designed for Windows 10 / 11
+
+## Usage
+
+### Dry run (recommended first)
+```powershell
+.\cleanup-non-windows-services.ps1
