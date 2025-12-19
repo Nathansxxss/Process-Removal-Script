@@ -29,6 +29,10 @@ This script helps you:
 
 ## 🚀 One-Liners
 
+> ⚠️ **Important**
+> These scripts **must be run in PowerShell opened as Administrator**.
+> Right-click PowerShell → **Run as administrator**.
+
 ### Run Script (GUI)
 
 ```powershell
@@ -74,7 +78,7 @@ If you ever see behavior like this, **do not run the script** — but this proje
 
 * Fully **open-source** — inspect every line
 * No encoded or obfuscated commands
-* No hidden persistence
+* No hidden persistence mechanisms
 * No telemetry or tracking
 * No external network activity
 
