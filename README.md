@@ -15,7 +15,7 @@ Windows by skipping critical system, network, GPU, and security services.
 
 ## Usage
 
-## One-liner (no file download)
+## One-liner
 
 Preview only:
 ```powershell
