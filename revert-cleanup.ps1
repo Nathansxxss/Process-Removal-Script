@@ -1,7 +1,6 @@
+Write-Host "=== Revert Cleanup (friendly mode) ===" -ForegroundColor Cyan
 
-Write-Host "Loading revert script..." -ForegroundColor Cyan
-
-# --- Resolve folder robustly ---
+# --- Resolve base folder robustly ---
 $BaseDir = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($BaseDir)) { $BaseDir = (Get-Location).Path }
 if ([string]::IsNullOrWhiteSpace($BaseDir)) { $BaseDir = $env:TEMP }
@@ -12,125 +11,106 @@ function Test-IsAdmin {
     $p  = New-Object Security.Principal.WindowsPrincipal($id)
     return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
+
 if (-not (Test-IsAdmin)) {
-    Write-Host "ERROR: Please run PowerShell as Administrator, then run this script again." -ForegroundColor Red
+    Write-Host "ERROR: Run PowerShell as Administrator, then run this script again." -ForegroundColor Red
     exit 1
 }
 
-# --- Helpers ---
-function Say($msg) { Write-Host $msg }
-function Run-UndoFile($path) {
-    if (-not (Test-Path $path)) { return $false }
-    Say "Running: $path"
+# --- Temporary execution policy bypass (THIS SESSION ONLY) ---
+# If a policy is enforced by your PC (Group Policy), this may fail — we handle that.
+try {
+    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force | Out-Null
+    Write-Host "ExecutionPolicy: temporary bypass enabled for this session." -ForegroundColor Green
+} catch {
+    Write-Host "ExecutionPolicy: could not set Process Bypass (policy may be enforced). Using fallbacks." -ForegroundColor Yellow
+}
+
+# --- Logging (best-effort) ---
+$LogPath = Join-Path $BaseDir ("revert-log_{0:yyyyMMdd_HHmmss}.txt" -f (Get-Date))
+function LogLine([string]$msg) {
+    $line = "[{0:HH:mm:ss}] {1}" -f (Get-Date), $msg
+    try { $line | Tee-Object -FilePath $LogPath -Append | Out-Null } catch { Write-Host $line }
+}
+
+LogLine "BaseDir: $BaseDir"
+LogLine "Log: $LogPath"
+
+# --- Find undo files in common locations ---
+function Find-UndoFile([string]$fileName) {
+    $candidates = @(
+        (Join-Path $BaseDir $fileName),
+        (Join-Path (Get-Location).Path $fileName),
+        (Join-Path $env:WINDIR "System32\$fileName")
+    ) | Select-Object -Unique
+
+    foreach ($p in $candidates) {
+        if (Test-Path $p) { return $p }
+    }
+    return $null
+}
+
+# --- Run undo file with friendly bypass behavior ---
+function Run-UndoFile([string]$path) {
+    if (-not $path -or -not (Test-Path $path)) { return $false }
+
+    Write-Host "Running: $path" -ForegroundColor Cyan
+    LogLine "Running: $path"
+
+    # 1) Try powershell.exe -ExecutionPolicy Bypass -File (usually works)
     try {
-        # Execute in its own scope
-        & $path
-        Say "OK: $path"
+        $args = @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", "`"$path`""
+        )
+
+        $proc = Start-Process -FilePath "powershell.exe" -ArgumentList ($args -join " ") -Wait -PassThru -WindowStyle Hidden
+        if ($proc.ExitCode -eq 0) {
+            Write-Host "OK: $path" -ForegroundColor Green
+            LogLine "OK via Start-Process: $path"
+            return $true
+        } else {
+            Write-Host "Note: ExitCode $($proc.ExitCode). Trying fallback..." -ForegroundColor Yellow
+            LogLine "Start-Process ExitCode $($proc.ExitCode) for $path"
+        }
+    } catch {
+        Write-Host "Note: couldn't run via Start-Process. Trying fallback..." -ForegroundColor Yellow
+        LogLine "Start-Process failed for $path : $($_.Exception.Message)"
+    }
+
+    # 2) Fallback: execute file contents (often bypasses script-file policy)
+    try {
+        iex (Get-Content $path -Raw)
+        Write-Host "OK (fallback): $path" -ForegroundColor Green
+        LogLine "OK via iex fallback: $path"
         return $true
     } catch {
         Write-Host "FAILED: $path -> $($_.Exception.Message)" -ForegroundColor Red
+        LogLine "FAILED for $path : $($_.Exception.Message)"
         return $false
     }
 }
 
-# --- Paths ---
-$undoServices = Join-Path $BaseDir "undo-services.ps1"
-$undoTweaks   = Join-Path $BaseDir "undo-tweaks.ps1"
+# --- Locate undo files ---
+$undoServices = Find-UndoFile "undo-services.ps1"
+$undoTweaks   = Find-UndoFile "undo-tweaks.ps1"
 
-# --- Run undo scripts if present ---
-$didAnything = $false
+if (-not $undoServices) { Write-Host "undo-services.ps1 not found (searched BaseDir/current/System32)." -ForegroundColor Yellow }
+if (-not $undoTweaks)   { Write-Host "undo-tweaks.ps1 not found (searched BaseDir/current/System32)." -ForegroundColor Yellow }
 
-if (Test-Path $undoServices) {
-    $didAnything = (Run-UndoFile $undoServices) -or $didAnything
+# --- Execute undo files ---
+$didSomething = $false
+if ($undoServices) { $didSomething = (Run-UndoFile $undoServices) -or $didSomething }
+if ($undoTweaks)   { $didSomething = (Run-UndoFile $undoTweaks) -or $didSomething }
+
+Write-Host ""
+if ($didSomething) {
+    Write-Host "Revert complete. Restart recommended." -ForegroundColor Green
+    LogLine "Revert complete."
 } else {
-    Say "Note: undo-services.ps1 not found in $BaseDir"
+    Write-Host "Nothing reverted (undo files missing or could not run)." -ForegroundColor Yellow
+    LogLine "Nothing reverted."
 }
 
-if (Test-Path $undoTweaks) {
-    $didAnything = (Run-UndoFile $undoTweaks) -or $didAnything
-} else {
-    Say "Note: undo-tweaks.ps1 not found in $BaseDir"
-}
-
-# --- Safe fallback tweaks (only if undo-tweaks.ps1 missing) ---
-if (-not (Test-Path $undoTweaks)) {
-    Say ""
-    Say "Fallback tweaks (safe):"
-    Say "1) Re-enable Widgets"
-    Say "2) Re-enable OneDrive startup (if possible)"
-    Say "3) Skip"
-    $choice = Read-Host "Choose 1/2/3"
-
-    if ($choice -eq "1") {
-        try {
-            $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-            if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
-            Set-ItemProperty -Path $path -Name "TaskbarDa" -Type DWord -Value 1
-            Say "Widgets set to Enabled (may require explorer restart or sign-out)."
-            $didAnything = $true
-        } catch {
-            Write-Host "Failed to enable Widgets: $($_.Exception.Message)" -ForegroundColor Red
-        }
-    }
-
-    if ($choice -eq "2") {
-        try {
-            # This can only restore if we know the previous run value.
-            # We'll just tell the user what to do.
-            Say "OneDrive startup restore needs the exact Run entry value."
-            Say "If you still have undo-tweaks.ps1, use that instead."
-            Say "Otherwise: reinstall/repair OneDrive and it will re-add its startup entry."
-        } catch {
-            Write-Host "Failed: $($_.Exception.Message)" -ForegroundColor Red
-        }
-    }
-}
-
-# --- Show what apps were removed (best-effort) ---
-Say ""
-Say "Looking for cleanup logs to list removed apps..."
-
-$logs = Get-ChildItem -Path $BaseDir -Filter "cleanup-log_*.txt" -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending
-
-if ($logs -and $logs.Count -gt 0) {
-    $latest = $logs[0].FullName
-    Say "Latest log: $latest"
-
-    try {
-        $lines = Get-Content $latest -ErrorAction Stop
-
-        $removedAppx = @()
-        foreach ($line in $lines) {
-            if ($line -match "Remove Appx:\s+(?<pkg>.+?)\s+\(dry-run=False\)") {
-                $removedAppx += $matches["pkg"].Trim()
-            }
-        }
-
-        $removedAppx = $removedAppx | Sort-Object -Unique
-
-        if ($removedAppx.Count -gt 0) {
-            Say ""
-            Say "Apps that were removed (from log):"
-            $removedAppx | ForEach-Object { Say " - $_" }
-
-            Say ""
-            Say "To reinstall most Store apps:"
-            Say " - Open Microsoft Store and search the app name"
-            Say " - Or use winget (if installed): winget search <name>  then winget install <id>"
-        } else {
-            Say "No removed Appx entries found in the latest log."
-        }
-    } catch {
-        Write-Host "Could not read log: $($_.Exception.Message)" -ForegroundColor Red
-    }
-} else {
-    Say "No cleanup-log_*.txt found in $BaseDir"
-}
-
-Say ""
-if ($didAnything) {
-    Write-Host "Revert finished. Restart your PC to fully apply restored settings." -ForegroundColor Green
-} else {
-    Write-Host "Nothing was reverted (undo files missing or no changes detected)." -ForegroundColor Yellow
-}
+Write-Host "Log saved to: $LogPath" -ForegroundColor Gray
