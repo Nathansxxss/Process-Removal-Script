@@ -1,9 +1,4 @@
-# Safe Cleanup GUI (conservative)
-# - Readable, human-coded
-# - Uses ListView (stable) with checkboxes
-# - Shows only DETECTED items
-# - Dry-run by default
-# - Protects critical Windows + Store/runtime components
+
 
 Write-Host "loading gui"
 
