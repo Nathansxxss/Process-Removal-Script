@@ -1,8 +1,9 @@
 # Reviewed and confirmed: conservative GUI tool.
 # - Works even when $PSScriptRoot is empty (IEX / copy-paste)
-# - Prints "loading gui" then "gui loaded, enjoy!"
+# - Fixes blank DataGridView by binding DataTables
 # - Dry-run by default
 # - Protects critical Windows + Store runtime components
+# - Prints "loading gui" then "gui loaded, enjoy!"
 
 Write-Host "loading gui"
 
@@ -27,7 +28,6 @@ function LogLine([string]$msg) {
     try {
         $line | Tee-Object -FilePath $Global:LogPath -Append | Out-Null
     } catch {
-        # If writing to file fails, still print something
         Write-Host $line
     }
 }
@@ -143,56 +143,6 @@ $AppxDenylist = @(
 )
 
 # ----------------------------
-# Data loaders
-# ----------------------------
-function Get-OptionalServiceRows {
-    $svcCim = Get-CimInstance Win32_Service
-    $rows = @()
-
-    foreach ($item in $OptionalServices) {
-        $name = $item.Name
-        if ($ProtectedServiceNames -contains $name) { continue }
-
-        $svc = $svcCim | Where-Object { $_.Name -eq $name } | Select-Object -First 1
-        if (-not $svc) { continue }
-
-        $rows += [PSCustomObject]@{
-            Select     = $false
-            Name       = $svc.Name
-            Display    = $svc.DisplayName
-            StartMode  = $svc.StartMode  # Auto / Manual / Disabled
-            State      = $svc.State
-            Reason     = $item.Reason
-        }
-    }
-
-    return $rows
-}
-
-function Get-AppxRows {
-    $installed = Get-AppxPackage -AllUsers
-    $rows = @()
-
-    foreach ($prefix in $AppxDenylist) {
-        if (Is-ProtectedAppxName $prefix) { continue }
-
-        $matches = $installed | Where-Object { $_.Name -eq $prefix -or $_.Name -like "$prefix*" }
-        foreach ($m in $matches) {
-            if (Is-ProtectedAppxName $m.Name) { continue }
-
-            $rows += [PSCustomObject]@{
-                Select          = $false
-                Name            = $m.Name
-                PackageFullName = $m.PackageFullName
-                Publisher       = $m.Publisher
-            }
-        }
-    }
-
-    return $rows | Sort-Object PackageFullName -Unique
-}
-
-# ----------------------------
 # Apply actions (still conservative)
 # ----------------------------
 function Create-RestorePoint {
@@ -230,15 +180,19 @@ function Write-ServiceUndoScript($beforeStates) {
     return $undoPath
 }
 
-function Apply-ServiceChanges($selectedRows, $targetMode, [bool]$dryRun) {
-    if (-not $selectedRows -or $selectedRows.Count -eq 0) { return $null }
+function Apply-ServiceChanges {
+    param(
+        [string[]]$ServiceNames,
+        [string]$TargetMode,
+        [bool]$DryRun
+    )
+
+    if (-not $ServiceNames -or $ServiceNames.Count -eq 0) { return $null }
 
     $cim = Get-CimInstance Win32_Service
     $before = @()
 
-    foreach ($row in $selectedRows) {
-        $svcName = $row.Name
-
+    foreach ($svcName in $ServiceNames) {
         if ($ProtectedServiceNames -contains $svcName) {
             LogLine "SKIP protected service: $svcName"
             continue
@@ -249,10 +203,10 @@ function Apply-ServiceChanges($selectedRows, $targetMode, [bool]$dryRun) {
 
         $before += [PSCustomObject]@{ Name=$svc.Name; StartMode=$svc.StartMode }
 
-        LogLine ("Service: {0} -> {1} (dry-run={2})" -f $svcName, $targetMode, $dryRun)
+        LogLine ("Service: {0} -> {1} (dry-run={2})" -f $svcName, $TargetMode, $DryRun)
 
-        if (-not $dryRun) {
-            $psMode = switch ($targetMode) {
+        if (-not $DryRun) {
+            $psMode = switch ($TargetMode) {
                 "Auto"     { "Automatic" }
                 "Manual"   { "Manual" }
                 "Disabled" { "Disabled" }
@@ -268,21 +222,20 @@ function Apply-ServiceChanges($selectedRows, $targetMode, [bool]$dryRun) {
     return $null
 }
 
-function Apply-AppxRemoval($selectedRows, [bool]$includeProvisioned, [bool]$dryRun) {
-    if (-not $selectedRows -or $selectedRows.Count -eq 0) { return }
+function Apply-AppxRemoval {
+    param(
+        [string[]]$SelectedAppNames,
+        [string[]]$SelectedPackageFullNames,
+        [bool]$IncludeProvisioned,
+        [bool]$DryRun
+    )
 
-    foreach ($row in $selectedRows) {
-        $name = $row.Name
-        $full = $row.PackageFullName
+    if (-not $SelectedPackageFullNames -or $SelectedPackageFullNames.Count -eq 0) { return }
 
-        if (Is-ProtectedAppxName $name) {
-            LogLine "SKIP protected Appx: $name"
-            continue
-        }
+    foreach ($full in $SelectedPackageFullNames) {
+        LogLine ("Remove Appx: {0} (dry-run={1})" -f $full, $DryRun)
 
-        LogLine ("Remove Appx: {0} (dry-run={1})" -f $full, $dryRun)
-
-        if (-not $dryRun) {
+        if (-not $DryRun) {
             try {
                 Remove-AppxPackage -AllUsers -Package $full -ErrorAction Stop
             } catch {
@@ -291,16 +244,15 @@ function Apply-AppxRemoval($selectedRows, [bool]$includeProvisioned, [bool]$dryR
         }
     }
 
-    if ($includeProvisioned) {
+    if ($IncludeProvisioned -and $SelectedAppNames -and $SelectedAppNames.Count -gt 0) {
         $prov = Get-AppxProvisionedPackage -Online
-        foreach ($row in $selectedRows) {
-            $prefix = $row.Name
+        foreach ($prefix in ($SelectedAppNames | Sort-Object -Unique)) {
             if (Is-ProtectedAppxName $prefix) { continue }
 
             $matches = $prov | Where-Object { $_.DisplayName -eq $prefix -or $_.DisplayName -like "$prefix*" }
             foreach ($m in $matches) {
-                LogLine ("Remove Provisioned: {0} (dry-run={1})" -f $m.PackageName, $dryRun)
-                if (-not $dryRun) {
+                LogLine ("Remove Provisioned: {0} (dry-run={1})" -f $m.PackageName, $DryRun)
+                if (-not $DryRun) {
                     try {
                         Remove-AppxProvisionedPackage -Online -PackageName $m.PackageName | Out-Null
                     } catch {
@@ -313,15 +265,78 @@ function Apply-AppxRemoval($selectedRows, [bool]$includeProvisioned, [bool]$dryR
 }
 
 # ----------------------------
-# Load GUI assemblies
+# Load GUI assemblies + System.Data (for DataTables)
 # ----------------------------
 try {
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
     Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+    Add-Type -AssemblyName System.Data -ErrorAction Stop
 } catch {
-    Write-Host "GUI failed to load (Windows Forms missing). Error: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "GUI failed to load. Error: $($_.Exception.Message)" -ForegroundColor Red
     LogLine "GUI failed to load: $($_.Exception.Message)"
     return
+}
+
+# ----------------------------
+# DataTable builders (fixes blank grids)
+# ----------------------------
+function Get-OptionalServicesTable {
+    $dt = New-Object System.Data.DataTable
+    [void]$dt.Columns.Add("Select",  [bool])
+    [void]$dt.Columns.Add("Name",    [string])
+    [void]$dt.Columns.Add("Display", [string])
+    [void]$dt.Columns.Add("StartMode",[string])
+    [void]$dt.Columns.Add("State",   [string])
+    [void]$dt.Columns.Add("Reason",  [string])
+
+    $svcCim = Get-CimInstance Win32_Service
+
+    foreach ($item in $OptionalServices) {
+        $name = $item.Name
+        if ($ProtectedServiceNames -contains $name) { continue }
+
+        $svc = $svcCim | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+        if (-not $svc) { continue }
+
+        $row = $dt.NewRow()
+        $row["Select"]   = $false
+        $row["Name"]     = $svc.Name
+        $row["Display"]  = $svc.DisplayName
+        $row["StartMode"]= $svc.StartMode
+        $row["State"]    = $svc.State
+        $row["Reason"]   = $item.Reason
+        [void]$dt.Rows.Add($row)
+    }
+
+    return $dt
+}
+
+function Get-AppxTable {
+    $dt = New-Object System.Data.DataTable
+    [void]$dt.Columns.Add("Select",         [bool])
+    [void]$dt.Columns.Add("Name",           [string])
+    [void]$dt.Columns.Add("PackageFullName",[string])
+    [void]$dt.Columns.Add("Publisher",      [string])
+
+    $installed = Get-AppxPackage -AllUsers
+
+    foreach ($prefix in $AppxDenylist) {
+        if (Is-ProtectedAppxName $prefix) { continue }
+
+        $matches = $installed | Where-Object { $_.Name -eq $prefix -or $_.Name -like "$prefix*" }
+        foreach ($m in $matches) {
+            if (Is-ProtectedAppxName $m.Name) { continue }
+
+            $row = $dt.NewRow()
+            $row["Select"]          = $false
+            $row["Name"]            = $m.Name
+            $row["PackageFullName"] = $m.PackageFullName
+            $row["Publisher"]       = $m.Publisher
+            [void]$dt.Rows.Add($row)
+        }
+    }
+
+    return $dt
 }
 
 # ----------------------------
@@ -402,9 +417,9 @@ try {
     # Services grid
     $gridSvc = New-Object System.Windows.Forms.DataGridView
     $gridSvc.Dock = "Fill"
-    $gridSvc.AutoGenerateColumns = $true
     $gridSvc.AllowUserToAddRows = $false
     $gridSvc.SelectionMode = "FullRowSelect"
+    $gridSvc.AutoSizeColumnsMode = "Fill"
 
     $svcPanel = New-Object System.Windows.Forms.Panel
     $svcPanel.Dock = "Top"
@@ -430,9 +445,9 @@ try {
     # Apps grid
     $gridApp = New-Object System.Windows.Forms.DataGridView
     $gridApp.Dock = "Fill"
-    $gridApp.AutoGenerateColumns = $true
     $gridApp.AllowUserToAddRows = $false
     $gridApp.SelectionMode = "FullRowSelect"
+    $gridApp.AutoSizeColumnsMode = "Fill"
 
     $appPanel = New-Object System.Windows.Forms.Panel
     $appPanel.Dock = "Top"
@@ -463,16 +478,21 @@ try {
 
     function Refresh-All {
         Status "Refreshing data..."
-        $svcRows = Get-OptionalServiceRows
+
+        $svcTable = Get-OptionalServicesTable
         $gridSvc.DataSource = $null
-        $gridSvc.DataSource = $svcRows
+        $gridSvc.DataSource = $svcTable
 
-        $appRows = Get-AppxRows
+        $appTable = Get-AppxTable
         $gridApp.DataSource = $null
-        $gridApp.DataSource = $appRows
+        $gridApp.DataSource = $appTable
 
-        Status ("Loaded optional services: {0}" -f $svcRows.Count)
-        Status ("Loaded removable Appx matches: {0}" -f $appRows.Count)
+        # Make the Select columns appear as checkboxes
+        if ($gridSvc.Columns["Select"]) { $gridSvc.Columns["Select"].ReadOnly = $false }
+        if ($gridApp.Columns["Select"]) { $gridApp.Columns["Select"].ReadOnly = $false }
+
+        Status ("Loaded optional services: {0}" -f $svcTable.Rows.Count)
+        Status ("Loaded removable Appx matches: {0}" -f $appTable.Rows.Count)
     }
 
     $btnRefresh.Add_Click({ Refresh-All })
@@ -490,24 +510,33 @@ try {
             return
         }
 
-        $selectedSvc = @()
+        # Collect selected services/apps directly from grid cell values (works with DataTables)
+        $selectedServiceNames = @()
         foreach ($row in $gridSvc.Rows) {
-            if ($row.Cells["Select"].Value -eq $true) { $selectedSvc += $row.DataBoundItem }
+            if ($row.IsNewRow) { continue }
+            if ([bool]$row.Cells["Select"].Value -eq $true) {
+                $selectedServiceNames += [string]$row.Cells["Name"].Value
+            }
         }
 
-        $selectedApp = @()
+        $selectedAppNames = @()
+        $selectedPackageFullNames = @()
         foreach ($row in $gridApp.Rows) {
-            if ($row.Cells["Select"].Value -eq $true) { $selectedApp += $row.DataBoundItem }
+            if ($row.IsNewRow) { continue }
+            if ([bool]$row.Cells["Select"].Value -eq $true) {
+                $selectedAppNames += [string]$row.Cells["Name"].Value
+                $selectedPackageFullNames += [string]$row.Cells["PackageFullName"].Value
+            }
         }
 
-        if (($selectedSvc.Count + $selectedApp.Count) -eq 0) {
+        if (($selectedServiceNames.Count + $selectedPackageFullNames.Count) -eq 0) {
             [System.Windows.Forms.MessageBox]::Show("Nothing selected.", "No selection") | Out-Null
             return
         }
 
         if (-not $dryRun) {
             $confirm = [System.Windows.Forms.MessageBox]::Show(
-                "Apply changes?`n`nServices: $($selectedSvc.Count)`nApps: $($selectedApp.Count)",
+                "Apply changes?`n`nServices: $($selectedServiceNames.Count)`nApps: $($selectedPackageFullNames.Count)",
                 "Confirm",
                 [System.Windows.Forms.MessageBoxButtons]::YesNo
             )
@@ -532,12 +561,12 @@ try {
             }
         }
 
-        $targetMode = $svcMode.SelectedItem
+        $targetMode = [string]$svcMode.SelectedItem
         Status ("Applying service changes (mode={0}, dry-run={1})..." -f $targetMode, $dryRun)
-        $undoPath = Apply-ServiceChanges -selectedRows $selectedSvc -targetMode $targetMode -dryRun:$dryRun
+        $undoPath = Apply-ServiceChanges -ServiceNames $selectedServiceNames -TargetMode $targetMode -DryRun:$dryRun
 
         Status ("Applying Appx removals (provisioned={0}, dry-run={1})..." -f $chkProv.Checked, $dryRun)
-        Apply-AppxRemoval -selectedRows $selectedApp -includeProvisioned:$chkProv.Checked -dryRun:$dryRun
+        Apply-AppxRemoval -SelectedAppNames $selectedAppNames -SelectedPackageFullNames $selectedPackageFullNames -IncludeProvisioned:$chkProv.Checked -DryRun:$dryRun
 
         Status "Done."
         if (-not $dryRun) {
