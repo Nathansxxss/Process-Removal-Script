@@ -16,7 +16,7 @@ Windows by skipping critical system, network, GPU, and security services.
 ## Usage
 
 ## One-liner
-### run Powershell as Administrator 
+### Run Powershell as Administrator 
 Gui:
 ```powershell
 irm https://raw.githubusercontent.com/Nathansxxss/Process-Removal-Script/main/cleanup-non-windows-services.ps1 | iex
