@@ -18,7 +18,7 @@ if (-not (Test-IsAdmin)) {
 }
 
 # --- Temporary execution policy bypass (THIS SESSION ONLY) ---
-# If a policy is enforced by your PC (Group Policy), this may fail — we handle that.
+# If a policy is enforced by your PC (Group Policy), this may fail
 try {
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force | Out-Null
     Write-Host "ExecutionPolicy: temporary bypass enabled for this session." -ForegroundColor Green
