@@ -27,17 +27,19 @@ This script helps you:
 
 ---
 
-## 🚀 Quick Start (One-Liner)
+## 🚀 One-Liners
 
-### GUI
-
-Run this in **PowerShell (Administrator)**:
+### Run Script (GUI)
 
 ```powershell
 irm https://raw.githubusercontent.com/Nathansxxss/Process-Removal-Script/main/cleanup-non-windows-services.ps1 | iex
 ```
 
-> 💡 **Tip:** Always review the script before running it, especially when using one-liners.
+### Undo Script
+
+```powershell
+irm https://raw.githubusercontent.com/Nathansxxss/Process-Removal-Script/main/revert-cleanup.ps1 | iex
+```
 
 ---
 
