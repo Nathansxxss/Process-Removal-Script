@@ -41,4 +41,68 @@ $SuspiciousPathPattern = "\\AppData\\|\\Temp\\|\\ProgramData\\|\\Users\\Public\\
 # Random / obfuscated service name patterns
 $SuspiciousNamePattern = '^[a-zA-Z]{1,3}\d{3,}$|^[a-f0-9]{8,}$'
 
-# Collect running services with execut
+# Collect running services with executable paths
+$services = Get-CimInstance Win32_Service | Where-Object {
+    $_.State -eq "Running"
+}
+
+$results = @()
+
+foreach ($svc in $services) {
+
+    # Skip Microsoft services entirely (non-negotiable)
+    if ($svc.Manufacturer -eq "Microsoft Corporation") {
+        continue
+    }
+
+    $exePath = $null
+    if ($svc.PathName) {
+        $exePath = ($svc.PathName -replace '"', '').Split(' ')[0]
+    }
+
+    $flags = @()
+
+    # 1. Executable path exists and is non-standard
+    if ($exePath -and (Test-Path $exePath)) {
+        if (-not ($SafeRoots | Where-Object { $exePath.StartsWith($_, 'OrdinalIgnoreCase') })) {
+            $flags += "Non-standard install path"
+        }
+
+        # 2. User-writable or commonly abused locations
+        if ($exePath -match $SuspiciousPathPattern) {
+            $flags += "User-writable / persistence location"
+        }
+
+        # 3. Unsigned executable
+        $sig = Get-AuthenticodeSignature $exePath
+        if ($sig.Status -ne "Valid") {
+            $flags += "Unsigned executable"
+        }
+    }
+
+    # 4. Suspicious or random-looking service name
+    if ($svc.Name -match $SuspiciousNamePattern) {
+        $flags += "Suspicious service name"
+    }
+
+    if ($flags.Count -gt 0) {
+        $results += [PSCustomObject]@{
+            Name        = $svc.Name
+            DisplayName = $svc.DisplayName
+            Executable  = $exePath
+            Indicators  = ($flags -join "; ")
+        }
+    }
+}
+
+if ($results.Count -eq 0) {
+    Write-Host "No suspicious services detected." -ForegroundColor Green
+    return
+}
+
+Write-Host "Potentially suspicious services found:" -ForegroundColor Yellow
+$results | Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "Review these entries manually before taking any action." -ForegroundColor Cyan
+Write-Host "This script does not remove or disable anything." -ForegroundColor Gray
