@@ -1,29 +1,44 @@
-# Reviewed and confirmed: GUI tool is conservative by design.
-# - Shows only allowlisted OPTIONAL services + a denylist of Appx bloat apps
+# Reviewed and confirmed: conservative GUI tool.
+# - Works even when $PSScriptRoot is empty (IEX / copy-paste)
+# - Prints "loading gui" then "gui loaded, enjoy!"
 # - Dry-run by default
-# - Creates restore point + writes undo scripts/logs
-# - Refuses to touch protected Windows/Store runtime components
+# - Protects critical Windows + Store runtime components
 
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
+Write-Host "loading gui"
 
 # ----------------------------
-# Admin check (needed for service changes / provisioned Appx removal)
+# Robust base directory (fixes $PSScriptRoot empty)
+# ----------------------------
+$BaseDir = $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($BaseDir)) {
+    $BaseDir = (Get-Location).Path
+}
+if ([string]::IsNullOrWhiteSpace($BaseDir)) {
+    $BaseDir = $env:TEMP
+}
+
+# ----------------------------
+# Logging (never hard-crash if log path fails)
+# ----------------------------
+$Global:LogPath = Join-Path $BaseDir ("cleanup-log_{0:yyyyMMdd_HHmmss}.txt" -f (Get-Date))
+
+function LogLine([string]$msg) {
+    $line = "[{0:HH:mm:ss}] {1}" -f (Get-Date), $msg
+    try {
+        $line | Tee-Object -FilePath $Global:LogPath -Append | Out-Null
+    } catch {
+        # If writing to file fails, still print something
+        Write-Host $line
+    }
+}
+
+# ----------------------------
+# Admin check
 # ----------------------------
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $p  = New-Object Security.Principal.WindowsPrincipal($id)
     return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-# ----------------------------
-# Logging helpers
-# ----------------------------
-$Global:LogPath = Join-Path $PSScriptRoot ("gui-cleanup-log_{0:yyyyMMdd_HHmmss}.txt" -f (Get-Date))
-
-function LogLine([string]$msg) {
-    $line = "[{0:HH:mm:ss}] {1}" -f (Get-Date), $msg
-    $line | Tee-Object -FilePath $Global:LogPath -Append | Out-Null
 }
 
 # ----------------------------
@@ -38,7 +53,7 @@ $ProtectedServiceNames = @(
     "WinDefend","WdNisSvc","MDCoreSvc","Sense","wscsvc","SecurityHealthService"
 )
 
-# Appx packages that must never be removed (Store + runtimes)
+# Appx packages that must never be removed (Store + runtimes + shell)
 $ProtectedAppxPatterns = @(
     "^Microsoft\.WindowsStore$",
     "^Microsoft\.StorePurchaseApp$",
@@ -63,21 +78,19 @@ function Is-ProtectedAppxName([string]$name) {
 }
 
 # ----------------------------
-# OPTIONAL SERVICES (explicit allowlist)
-# Only these are shown in the GUI for disabling/changing.
-# Add more if you know what they do.
+# OPTIONAL SERVICES (explicit allowlist only)
+# Only these appear in the GUI for service changes.
 # ----------------------------
 $OptionalServices = @(
-    # name, friendly reason
     @{ Name="WSearch";   Reason="Windows Search indexing (optional). Disabling can slow searches." },
     @{ Name="Spooler";   Reason="Printing service (optional if you never print)." },
-    @{ Name="DoSvc";     Reason="Delivery Optimization (optional). Affects Windows Update download behavior." },
-    @{ Name="DiagTrack"; Reason="Telemetry/diagnostics service (optional)." }
+    @{ Name="DoSvc";     Reason="Delivery Optimization (optional). Affects update download behavior." },
+    @{ Name="DiagTrack"; Reason="Telemetry/diagnostics (optional)." }
 )
 
 # ----------------------------
 # APPX DENYLIST (your bloat list)
-# Note: We treat these as prefixes (some packages include suffixes/versions)
+# Matches as prefixes (Name or Name*)
 # ----------------------------
 $AppxDenylist = @(
     "26720RandomSaladGamesLLC.SimpleMahjong",
@@ -143,17 +156,13 @@ function Get-OptionalServiceRows {
         $svc = $svcCim | Where-Object { $_.Name -eq $name } | Select-Object -First 1
         if (-not $svc) { continue }
 
-        $startMode = $svc.StartMode   # Auto / Manual / Disabled
-        $state     = $svc.State       # Running / Stopped
-        $reason    = $item.Reason
-
         $rows += [PSCustomObject]@{
             Select     = $false
             Name       = $svc.Name
             Display    = $svc.DisplayName
-            StartMode  = $startMode
-            State      = $state
-            Reason     = $reason
+            StartMode  = $svc.StartMode  # Auto / Manual / Disabled
+            State      = $svc.State
+            Reason     = $item.Reason
         }
     }
 
@@ -172,26 +181,24 @@ function Get-AppxRows {
             if (Is-ProtectedAppxName $m.Name) { continue }
 
             $rows += [PSCustomObject]@{
-                Select        = $false
-                Name          = $m.Name
+                Select          = $false
+                Name            = $m.Name
                 PackageFullName = $m.PackageFullName
-                Publisher     = $m.Publisher
-                InstallLocation = $m.InstallLocation
+                Publisher       = $m.Publisher
             }
         }
     }
 
-    # Unique by PackageFullName
     return $rows | Sort-Object PackageFullName -Unique
 }
 
 # ----------------------------
-# Apply actions
+# Apply actions (still conservative)
 # ----------------------------
 function Create-RestorePoint {
     try {
         LogLine "Creating restore point..."
-        Checkpoint-Computer -Description "Before GUI cleanup changes" -RestorePointType "MODIFY_SETTINGS"
+        Checkpoint-Computer -Description "Before cleanup GUI changes" -RestorePointType "MODIFY_SETTINGS"
         LogLine "Restore point created."
         return $true
     } catch {
@@ -201,9 +208,9 @@ function Create-RestorePoint {
 }
 
 function Write-ServiceUndoScript($beforeStates) {
-    $undoPath = Join-Path $PSScriptRoot "undo-services.ps1"
+    $undoPath = Join-Path $BaseDir "undo-services.ps1"
     $lines = @(
-        "# Undo script generated by gui-cleanup.ps1",
+        "# Undo script generated by cleanup GUI",
         "# Restores service StartMode values captured before changes.",
         ""
     )
@@ -219,17 +226,19 @@ function Write-ServiceUndoScript($beforeStates) {
     }
 
     $lines | Out-File -Encoding UTF8 -FilePath $undoPath
-    LogLine "Wrote undo script: $undoPath"
+    LogLine "Undo script written: $undoPath"
+    return $undoPath
 }
 
 function Apply-ServiceChanges($selectedRows, $targetMode, [bool]$dryRun) {
-    if (-not $selectedRows -or $selectedRows.Count -eq 0) { return }
+    if (-not $selectedRows -or $selectedRows.Count -eq 0) { return $null }
 
     $cim = Get-CimInstance Win32_Service
     $before = @()
 
     foreach ($row in $selectedRows) {
         $svcName = $row.Name
+
         if ($ProtectedServiceNames -contains $svcName) {
             LogLine "SKIP protected service: $svcName"
             continue
@@ -254,8 +263,9 @@ function Apply-ServiceChanges($selectedRows, $targetMode, [bool]$dryRun) {
     }
 
     if ($before.Count -gt 0) {
-        Write-ServiceUndoScript $before
+        return Write-ServiceUndoScript $before
     }
+    return $null
 }
 
 function Apply-AppxRemoval($selectedRows, [bool]$includeProvisioned, [bool]$dryRun) {
@@ -303,244 +313,259 @@ function Apply-AppxRemoval($selectedRows, [bool]$includeProvisioned, [bool]$dryR
 }
 
 # ----------------------------
-# GUI setup
+# Load GUI assemblies
 # ----------------------------
-$form = New-Object System.Windows.Forms.Form
-$form.Text = "Safe Cleanup GUI (Read-first)"
-$form.Size = New-Object System.Drawing.Size(980, 650)
-$form.StartPosition = "CenterScreen"
-
-$tabs = New-Object System.Windows.Forms.TabControl
-$tabs.Dock = "Fill"
-
-$tabServices = New-Object System.Windows.Forms.TabPage
-$tabServices.Text = "Optional Services"
-
-$tabApps = New-Object System.Windows.Forms.TabPage
-$tabApps.Text = "Bloat Apps (Appx)"
-
-# Top control panel
-$topPanel = New-Object System.Windows.Forms.Panel
-$topPanel.Height = 70
-$topPanel.Dock = "Top"
-
-$chkDryRun = New-Object System.Windows.Forms.CheckBox
-$chkDryRun.Text = "Dry-run (no changes)"
-$chkDryRun.Checked = $true
-$chkDryRun.AutoSize = $true
-$chkDryRun.Location = New-Object System.Drawing.Point(12, 12)
-
-$chkRestore = New-Object System.Windows.Forms.CheckBox
-$chkRestore.Text = "Create restore point before Apply"
-$chkRestore.Checked = $true
-$chkRestore.AutoSize = $true
-$chkRestore.Location = New-Object System.Drawing.Point(12, 38)
-
-$lblAdmin = New-Object System.Windows.Forms.Label
-$lblAdmin.AutoSize = $true
-$lblAdmin.Location = New-Object System.Drawing.Point(260, 14)
-
-if (Test-IsAdmin) {
-    $lblAdmin.Text = "Admin: YES"
-    $lblAdmin.ForeColor = [System.Drawing.Color]::DarkGreen
-} else {
-    $lblAdmin.Text = "Admin: NO (service/app removal will likely fail)"
-    $lblAdmin.ForeColor = [System.Drawing.Color]::DarkRed
-}
-
-$btnRefresh = New-Object System.Windows.Forms.Button
-$btnRefresh.Text = "Refresh"
-$btnRefresh.Size = New-Object System.Drawing.Size(120, 30)
-$btnRefresh.Location = New-Object System.Drawing.Point(760, 18)
-
-$btnApply = New-Object System.Windows.Forms.Button
-$btnApply.Text = "Apply Selected"
-$btnApply.Size = New-Object System.Drawing.Size(150, 30)
-$btnApply.Location = New-Object System.Drawing.Point(880, 18)
-
-$topPanel.Controls.AddRange(@($chkDryRun, $chkRestore, $lblAdmin, $btnRefresh, $btnApply))
-
-# Status box
-$statusBox = New-Object System.Windows.Forms.TextBox
-$statusBox.Multiline = $true
-$statusBox.ReadOnly = $true
-$statusBox.Dock = "Bottom"
-$statusBox.Height = 90
-$statusBox.ScrollBars = "Vertical"
-
-function Status([string]$msg) {
-    $statusBox.AppendText($msg + [Environment]::NewLine)
-    LogLine $msg
-}
-
-Status "Log: $Global:LogPath"
-
-# --- Services grid ---
-$gridSvc = New-Object System.Windows.Forms.DataGridView
-$gridSvc.Dock = "Fill"
-$gridSvc.AutoGenerateColumns = $true
-$gridSvc.AllowUserToAddRows = $false
-$gridSvc.SelectionMode = "FullRowSelect"
-
-# Service action controls
-$svcPanel = New-Object System.Windows.Forms.Panel
-$svcPanel.Dock = "Top"
-$svcPanel.Height = 48
-
-$svcMode = New-Object System.Windows.Forms.ComboBox
-$svcMode.DropDownStyle = "DropDownList"
-$svcMode.Items.AddRange(@("Manual","Disabled","Auto"))
-$svcMode.SelectedItem = "Manual"
-$svcMode.Location = New-Object System.Drawing.Point(12, 12)
-$svcMode.Width = 140
-
-$svcHint = New-Object System.Windows.Forms.Label
-$svcHint.Text = "Only allowlisted optional services appear here."
-$svcHint.AutoSize = $true
-$svcHint.Location = New-Object System.Drawing.Point(170, 15)
-
-$svcPanel.Controls.AddRange(@($svcMode, $svcHint))
-
-$tabServices.Controls.Add($gridSvc)
-$tabServices.Controls.Add($svcPanel)
-
-# --- Apps grid ---
-$gridApp = New-Object System.Windows.Forms.DataGridView
-$gridApp.Dock = "Fill"
-$gridApp.AutoGenerateColumns = $true
-$gridApp.AllowUserToAddRows = $false
-$gridApp.SelectionMode = "FullRowSelect"
-
-$appPanel = New-Object System.Windows.Forms.Panel
-$appPanel.Dock = "Top"
-$appPanel.Height = 48
-
-$chkProv = New-Object System.Windows.Forms.CheckBox
-$chkProv.Text = "Also remove provisioned (preinstalled) copies"
-$chkProv.AutoSize = $true
-$chkProv.Location = New-Object System.Drawing.Point(12, 14)
-
-$appHint = New-Object System.Windows.Forms.Label
-$appHint.Text = "Protected Store/runtimes are always skipped."
-$appHint.AutoSize = $true
-$appHint.Location = New-Object System.Drawing.Point(300, 15)
-
-$appPanel.Controls.AddRange(@($chkProv, $appHint))
-
-$tabApps.Controls.Add($gridApp)
-$tabApps.Controls.Add($appPanel)
-
-# Tabs
-$tabs.TabPages.Add($tabServices)
-$tabs.TabPages.Add($tabApps)
-
-# Layout
-$form.Controls.Add($tabs)
-$form.Controls.Add($statusBox)
-$form.Controls.Add($topPanel)
-
-# ----------------------------
-# Refresh data bindings
-# ----------------------------
-function Refresh-All {
-    Status "Refreshing data..."
-
-    $svcRows = Get-OptionalServiceRows
-    $gridSvc.DataSource = $null
-    $gridSvc.DataSource = $svcRows
-
-    $appRows = Get-AppxRows
-    $gridApp.DataSource = $null
-    $gridApp.DataSource = $appRows
-
-    Status ("Loaded optional services: {0}" -f ($svcRows.Count))
-    Status ("Loaded removable Appx matches: {0}" -f ($appRows.Count))
+try {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+} catch {
+    Write-Host "GUI failed to load (Windows Forms missing). Error: $($_.Exception.Message)" -ForegroundColor Red
+    LogLine "GUI failed to load: $($_.Exception.Message)"
+    return
 }
 
 # ----------------------------
-# Apply button logic
+# Build GUI
 # ----------------------------
-$btnApply.Add_Click({
-    $dryRun = $chkDryRun.Checked
-    $wantRestore = $chkRestore.Checked
+$guiLoaded = $false
 
-    if (-not (Test-IsAdmin)) {
-        [System.Windows.Forms.MessageBox]::Show("Not running as Administrator. Service/app removal may fail. Right-click PowerShell > Run as Administrator.", "Admin required")
-        Status "Apply attempted without admin. You should run as Administrator."
-        return
+try {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Safe Cleanup GUI"
+    $form.Size = New-Object System.Drawing.Size(980, 650)
+    $form.StartPosition = "CenterScreen"
+
+    $tabs = New-Object System.Windows.Forms.TabControl
+    $tabs.Dock = "Fill"
+
+    $tabServices = New-Object System.Windows.Forms.TabPage
+    $tabServices.Text = "Optional Services"
+
+    $tabApps = New-Object System.Windows.Forms.TabPage
+    $tabApps.Text = "Bloat Apps (Appx)"
+
+    # Top panel
+    $topPanel = New-Object System.Windows.Forms.Panel
+    $topPanel.Height = 70
+    $topPanel.Dock = "Top"
+
+    $chkDryRun = New-Object System.Windows.Forms.CheckBox
+    $chkDryRun.Text = "Dry-run (no changes)"
+    $chkDryRun.Checked = $true
+    $chkDryRun.AutoSize = $true
+    $chkDryRun.Location = New-Object System.Drawing.Point(12, 12)
+
+    $chkRestore = New-Object System.Windows.Forms.CheckBox
+    $chkRestore.Text = "Create restore point before Apply"
+    $chkRestore.Checked = $true
+    $chkRestore.AutoSize = $true
+    $chkRestore.Location = New-Object System.Drawing.Point(12, 38)
+
+    $lblAdmin = New-Object System.Windows.Forms.Label
+    $lblAdmin.AutoSize = $true
+    $lblAdmin.Location = New-Object System.Drawing.Point(260, 14)
+    if (Test-IsAdmin) {
+        $lblAdmin.Text = "Admin: YES"
+        $lblAdmin.ForeColor = [System.Drawing.Color]::DarkGreen
+    } else {
+        $lblAdmin.Text = "Admin: NO (run as Administrator for Apply)"
+        $lblAdmin.ForeColor = [System.Drawing.Color]::DarkRed
     }
 
-    # Collect selected rows based on checkbox column "Select"
-    $selectedSvc = @()
-    foreach ($row in $gridSvc.Rows) {
-        if ($row.Cells["Select"].Value -eq $true) {
-            $selectedSvc += $row.DataBoundItem
-        }
+    $btnRefresh = New-Object System.Windows.Forms.Button
+    $btnRefresh.Text = "Refresh"
+    $btnRefresh.Size = New-Object System.Drawing.Size(120, 30)
+    $btnRefresh.Location = New-Object System.Drawing.Point(760, 18)
+
+    $btnApply = New-Object System.Windows.Forms.Button
+    $btnApply.Text = "Apply Selected"
+    $btnApply.Size = New-Object System.Drawing.Size(150, 30)
+    $btnApply.Location = New-Object System.Drawing.Point(880, 18)
+
+    $topPanel.Controls.AddRange(@($chkDryRun, $chkRestore, $lblAdmin, $btnRefresh, $btnApply))
+
+    # Status box
+    $statusBox = New-Object System.Windows.Forms.TextBox
+    $statusBox.Multiline = $true
+    $statusBox.ReadOnly = $true
+    $statusBox.Dock = "Bottom"
+    $statusBox.Height = 90
+    $statusBox.ScrollBars = "Vertical"
+
+    function Status([string]$msg) {
+        $statusBox.AppendText($msg + [Environment]::NewLine)
+        LogLine $msg
     }
 
-    $selectedApp = @()
-    foreach ($row in $gridApp.Rows) {
-        if ($row.Cells["Select"].Value -eq $true) {
-            $selectedApp += $row.DataBoundItem
-        }
+    Status "Log: $Global:LogPath"
+
+    # Services grid
+    $gridSvc = New-Object System.Windows.Forms.DataGridView
+    $gridSvc.Dock = "Fill"
+    $gridSvc.AutoGenerateColumns = $true
+    $gridSvc.AllowUserToAddRows = $false
+    $gridSvc.SelectionMode = "FullRowSelect"
+
+    $svcPanel = New-Object System.Windows.Forms.Panel
+    $svcPanel.Dock = "Top"
+    $svcPanel.Height = 48
+
+    $svcMode = New-Object System.Windows.Forms.ComboBox
+    $svcMode.DropDownStyle = "DropDownList"
+    $svcMode.Items.AddRange(@("Manual","Disabled","Auto"))
+    $svcMode.SelectedItem = "Manual"
+    $svcMode.Location = New-Object System.Drawing.Point(12, 12)
+    $svcMode.Width = 140
+
+    $svcHint = New-Object System.Windows.Forms.Label
+    $svcHint.Text = "Only explicit optional services appear here."
+    $svcHint.AutoSize = $true
+    $svcHint.Location = New-Object System.Drawing.Point(170, 15)
+
+    $svcPanel.Controls.AddRange(@($svcMode, $svcHint))
+
+    $tabServices.Controls.Add($gridSvc)
+    $tabServices.Controls.Add($svcPanel)
+
+    # Apps grid
+    $gridApp = New-Object System.Windows.Forms.DataGridView
+    $gridApp.Dock = "Fill"
+    $gridApp.AutoGenerateColumns = $true
+    $gridApp.AllowUserToAddRows = $false
+    $gridApp.SelectionMode = "FullRowSelect"
+
+    $appPanel = New-Object System.Windows.Forms.Panel
+    $appPanel.Dock = "Top"
+    $appPanel.Height = 48
+
+    $chkProv = New-Object System.Windows.Forms.CheckBox
+    $chkProv.Text = "Also remove provisioned (preinstalled) copies"
+    $chkProv.AutoSize = $true
+    $chkProv.Location = New-Object System.Drawing.Point(12, 14)
+
+    $appHint = New-Object System.Windows.Forms.Label
+    $appHint.Text = "Protected Store/runtimes are always skipped."
+    $appHint.AutoSize = $true
+    $appHint.Location = New-Object System.Drawing.Point(330, 15)
+
+    $appPanel.Controls.AddRange(@($chkProv, $appHint))
+
+    $tabApps.Controls.Add($gridApp)
+    $tabApps.Controls.Add($appPanel)
+
+    # Tabs
+    $tabs.TabPages.Add($tabServices)
+    $tabs.TabPages.Add($tabApps)
+
+    $form.Controls.Add($tabs)
+    $form.Controls.Add($statusBox)
+    $form.Controls.Add($topPanel)
+
+    function Refresh-All {
+        Status "Refreshing data..."
+        $svcRows = Get-OptionalServiceRows
+        $gridSvc.DataSource = $null
+        $gridSvc.DataSource = $svcRows
+
+        $appRows = Get-AppxRows
+        $gridApp.DataSource = $null
+        $gridApp.DataSource = $appRows
+
+        Status ("Loaded optional services: {0}" -f $svcRows.Count)
+        Status ("Loaded removable Appx matches: {0}" -f $appRows.Count)
     }
 
-    if (($selectedSvc.Count + $selectedApp.Count) -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("Nothing selected.", "No selection")
-        return
-    }
+    $btnRefresh.Add_Click({ Refresh-All })
 
-    if (-not $dryRun) {
-        $confirm = [System.Windows.Forms.MessageBox]::Show(
-            "You're about to APPLY changes.`n`nServices selected: $($selectedSvc.Count)`nApps selected: $($selectedApp.Count)`n`nContinue?",
-            "Confirm apply",
-            [System.Windows.Forms.MessageBoxButtons]::YesNo
-        )
-        if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) {
-            Status "Apply cancelled by user."
+    $btnApply.Add_Click({
+        $dryRun = $chkDryRun.Checked
+        $wantRestore = $chkRestore.Checked
+
+        if (-not (Test-IsAdmin)) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Run PowerShell as Administrator to apply changes.",
+                "Admin required"
+            ) | Out-Null
+            Status "Apply blocked: not running as Administrator."
             return
         }
-    }
 
-    if ($wantRestore -and -not $dryRun) {
-        $ok = Create-RestorePoint
-        if (-not $ok) {
-            $c = [System.Windows.Forms.MessageBox]::Show(
-                "Restore point failed. Continue anyway?",
-                "Restore point failed",
+        $selectedSvc = @()
+        foreach ($row in $gridSvc.Rows) {
+            if ($row.Cells["Select"].Value -eq $true) { $selectedSvc += $row.DataBoundItem }
+        }
+
+        $selectedApp = @()
+        foreach ($row in $gridApp.Rows) {
+            if ($row.Cells["Select"].Value -eq $true) { $selectedApp += $row.DataBoundItem }
+        }
+
+        if (($selectedSvc.Count + $selectedApp.Count) -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("Nothing selected.", "No selection") | Out-Null
+            return
+        }
+
+        if (-not $dryRun) {
+            $confirm = [System.Windows.Forms.MessageBox]::Show(
+                "Apply changes?`n`nServices: $($selectedSvc.Count)`nApps: $($selectedApp.Count)",
+                "Confirm",
                 [System.Windows.Forms.MessageBoxButtons]::YesNo
             )
-            if ($c -ne [System.Windows.Forms.DialogResult]::Yes) {
-                Status "Apply cancelled due to restore point failure."
+            if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) {
+                Status "Apply cancelled by user."
                 return
             }
         }
-    }
 
-    # Apply services (allowlisted only)
-    $targetMode = $svcMode.SelectedItem
-    $cimMode = switch ($targetMode) { "Auto" { "Auto" } "Manual" { "Manual" } "Disabled" { "Disabled" } default { "Manual" } }
+        if ($wantRestore -and -not $dryRun) {
+            $ok = Create-RestorePoint
+            if (-not $ok) {
+                $c = [System.Windows.Forms.MessageBox]::Show(
+                    "Restore point failed. Continue anyway?",
+                    "Restore point failed",
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo
+                )
+                if ($c -ne [System.Windows.Forms.DialogResult]::Yes) {
+                    Status "Apply cancelled due to restore point failure."
+                    return
+                }
+            }
+        }
 
-    Status ("Applying service changes (mode={0}, dry-run={1})..." -f $cimMode, $dryRun)
-    Apply-ServiceChanges -selectedRows $selectedSvc -targetMode $cimMode -dryRun:$dryRun
+        $targetMode = $svcMode.SelectedItem
+        Status ("Applying service changes (mode={0}, dry-run={1})..." -f $targetMode, $dryRun)
+        $undoPath = Apply-ServiceChanges -selectedRows $selectedSvc -targetMode $targetMode -dryRun:$dryRun
 
-    # Apply app removals (denylist matches only)
-    Status ("Applying Appx removals (provisioned={0}, dry-run={1})..." -f $chkProv.Checked, $dryRun)
-    Apply-AppxRemoval -selectedRows $selectedApp -includeProvisioned:$chkProv.Checked -dryRun:$dryRun
+        Status ("Applying Appx removals (provisioned={0}, dry-run={1})..." -f $chkProv.Checked, $dryRun)
+        Apply-AppxRemoval -selectedRows $selectedApp -includeProvisioned:$chkProv.Checked -dryRun:$dryRun
 
-    Status "Done."
-    if (-not $dryRun) {
-        Status "A restart is recommended."
-        [System.Windows.Forms.MessageBox]::Show("Done. Restart recommended.`nUndo script: undo-services.ps1 (if services were changed).`nLog: $Global:LogPath", "Completed")
-    } else {
-        [System.Windows.Forms.MessageBox]::Show("Dry-run complete. No changes were made.`nLog: $Global:LogPath", "Dry-run")
-    }
-})
+        Status "Done."
+        if (-not $dryRun) {
+            $msg = "Done. Restart recommended.`nLog: $Global:LogPath"
+            if ($undoPath) { $msg += "`nUndo: $undoPath" }
+            [System.Windows.Forms.MessageBox]::Show($msg, "Completed") | Out-Null
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("Dry-run complete. No changes were made.", "Dry-run") | Out-Null
+        }
+    })
 
-$btnRefresh.Add_Click({ Refresh-All })
+    Refresh-All
 
-# First load
-Refresh-All
+    $guiLoaded = ($form -ne $null -and $tabs -ne $null -and $gridSvc -ne $null -and $gridApp -ne $null)
+} catch {
+    Write-Host "GUI build failed: $($_.Exception.Message)" -ForegroundColor Red
+    LogLine "GUI build failed: $($_.Exception.Message)"
+    return
+}
 
-# Run UI
+if ($guiLoaded) {
+    Write-Host "gui loaded, enjoy!"
+    LogLine "GUI loaded successfully."
+} else {
+    Write-Host "GUI failed to load." -ForegroundColor Red
+    LogLine "GUI failed to load (unknown reason)."
+    return
+}
+
+# Show UI
 [void]$form.ShowDialog()
