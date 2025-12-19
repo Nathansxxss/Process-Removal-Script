@@ -14,6 +14,7 @@ Windows by skipping critical system, network, GPU, and security services.
 - Designed for Windows 10 / 11
 
 ## Usage
+<img width="1059" height="561" alt="image" src="https://github.com/user-attachments/assets/b411b98a-dd2e-4e8a-a9d9-00f23c75fc6f" />
 
 ## One-liner
 ### Run Powershell as Administrator 
