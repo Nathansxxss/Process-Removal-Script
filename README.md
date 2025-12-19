@@ -17,6 +17,6 @@ Windows by skipping critical system, network, GPU, and security services.
 
 ## One-liner
 
-Preview only:
+Gui:
 ```powershell
 irm https://raw.githubusercontent.com/Nathansxxss/Process-Removal-Script/main/cleanup-non-windows-services.ps1 | iex
